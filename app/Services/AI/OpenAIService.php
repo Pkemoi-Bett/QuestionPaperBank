@@ -4,6 +4,10 @@ namespace App\Services\AI;
 
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use App\Models\Answer;
+use App\Models\Question;
+use App\Models\QuestionPaper;
+use App\Services\AI\AIServiceInterface;
 
 class OpenAIService implements AIServiceInterface
 {
@@ -42,6 +46,9 @@ class OpenAIService implements AIServiceInterface
         $partialKey = substr($this->apiKey, 0, 8) . '...';
         Log::debug("Initialized OpenAIService with key starting with: {$partialKey}");
     }
+
+
+
     
     /**
      * Analyze document content using OpenAI
@@ -49,50 +56,174 @@ class OpenAIService implements AIServiceInterface
      * @param string $text The document text to analyze
      * @return array The analysis result
      */
+    
+    /**
+ * Analyze document content using OpenAI with retry logic
+ * 
+ * @param string $text The document text to analyze
+ * @return array The analysis result
+ */
     public function analyzeDocumentContent(string $text): array
     {
-        try {
-            Log::info('Sending request to OpenAI API');
-            
-            $response = Http::withHeaders([
-                'Authorization' => "Bearer {$this->apiKey}",
-                'Content-Type' => 'application/json',
-            ])->timeout(60)->post("{$this->apiEndpoint}/chat/completions", [
-                'model' => 'gpt-4o',
-                'messages' => [
-                    [
-                        'role' => 'system',
-                        'content' => $this->getSystemPrompt()
-                    ],
-                    [
-                        'role' => 'user',
-                        'content' => "Extract the following information from this exam paper document:\n\n{$text}"
-                    ]
-                ],
-                'temperature' => 0.3,
-                'max_tokens' => 4000
-            ]);
-            
-            if ($response->successful()) {
-                $data = $response->json();
-                Log::info('Received successful response from OpenAI');
+        $attempts = 0;
+        $maxAttempts = 3;
+        
+        while ($attempts < $maxAttempts) {
+            try {
+                Log::info('Sending request to OpenAI API (attempt ' . ($attempts + 1) . ')');
                 
-                if (isset($data['choices'][0]['message']['content'])) {
-                    $content = $data['choices'][0]['message']['content'];
-                    return $this->parseAIResponse($content);
+                $response = Http::withHeaders([
+                    'Authorization' => "Bearer {$this->apiKey}",
+                    'Content-Type' => 'application/json',
+                ])->timeout(90) // Increased timeout
+                ->post("{$this->apiEndpoint}/chat/completions", [
+                    'model' => 'gpt-4o',
+                    'messages' => [
+                        [
+                            'role' => 'system',
+                            'content' => $this->getSystemPrompt()
+                        ],
+                        [
+                            'role' => 'user',
+                            'content' => "Extract the following information from this exam paper document:\n\n{$text}"
+                        ]
+                    ],
+                    'temperature' => 0.3,
+                    'max_tokens' => 4000
+                ]);
+                
+                if ($response->successful()) {
+                    $data = $response->json();
+                    Log::info('Received successful response from OpenAI');
+                    
+                    if (isset($data['choices'][0]['message']['content'])) {
+                        $content = $data['choices'][0]['message']['content'];
+                        return $this->parseAIResponse($content);
+                    }
+                    
+                    Log::error('Unexpected OpenAI response format', ['response' => $data]);
+                    return ['error' => 'Invalid response format from OpenAI API'];
+                } else {
+                    $error = $response->json();
+                    Log::error('OpenAI API error:', $error);
+                    
+                    // For certain error types, we might want to retry immediately
+                    $errorMessage = $error['error']['message'] ?? 'Unknown error';
+                    $errorType = $error['error']['type'] ?? '';
+                    
+                    // Don't retry for authentication or invalid request errors
+                    if (in_array($errorType, ['authentication_error', 'invalid_request_error'])) {
+                        return ['error' => 'Failed to analyze document with OpenAI: ' . $errorMessage];
+                    }
+                    
+                    // For rate limits and server errors, increment attempts and retry
+                    $attempts++;
+                    Log::warning("Attempt {$attempts} failed: {$errorMessage}");
+                    
+                    if ($attempts >= $maxAttempts) {
+                        return ['error' => 'Failed after multiple attempts: ' . $errorMessage];
+                    }
+                    
+                    // Wait before retry (exponential backoff)
+                    $backoffTime = pow(2, $attempts);
+                    Log::info("Waiting {$backoffTime} seconds before retry");
+                    sleep($backoffTime);
+                    continue;
+                }
+            } catch (\Exception $e) {
+                $attempts++;
+                Log::warning("Attempt {$attempts} failed with exception: " . $e->getMessage());
+                
+                if ($attempts >= $maxAttempts) {
+                    return ['error' => 'Failed after multiple attempts: ' . $e->getMessage()];
                 }
                 
-                Log::error('Unexpected OpenAI response format', ['response' => $data]);
-                return ['error' => 'Invalid response format from OpenAI API'];
-            } else {
-                $error = $response->json();
-                Log::error('OpenAI API error:', $error);
-                return ['error' => 'Failed to analyze document with OpenAI: ' . ($error['error']['message'] ?? 'Unknown error')];
+                // Wait before retry (exponential backoff)
+                $backoffTime = pow(2, $attempts);
+                Log::info("Waiting {$backoffTime} seconds before retry");
+                sleep($backoffTime);
+                continue;
             }
-        } catch (\Exception $e) {
-            Log::error('Exception in OpenAI analysis:', ['message' => $e->getMessage()]);
-            return ['error' => 'Failed to analyze document with OpenAI: ' . $e->getMessage()];
         }
+        
+        // This should not be reached due to the return statements above,
+        // but adding as a safeguard
+        return ['error' => 'Failed to analyze document after exhausting retry attempts'];
+    }
+
+    protected function analyzeDocumentInChunks(string $text): array
+    {
+            $chunks = $this->splitTextIntoChunks($text, 8000); // 8K chars per chunk
+            $metadata = [];
+            $allQuestions = [];
+            
+            // Process each chunk separately
+            foreach ($chunks as $index => $chunk) {
+                try {
+                    $response = Http::withHeaders([
+                        'Authorization' => "Bearer {$this->apiKey}",
+                        'Content-Type' => 'application/json',
+                    ])->timeout(30)->post("{$this->apiEndpoint}/chat/completions", [
+                        'model' => 'gpt-4o',
+                        'messages' => [
+                            [
+                                'role' => 'system',
+                                'content' => $this->getSystemPrompt()
+                            ],
+                            [
+                                'role' => 'user',
+                                'content' => "This is part " . ($index + 1) . " of the exam paper. Extract information from this section:\n\n{$chunk}"
+                            ]
+                        ],
+                        'temperature' => 0.3,
+                        'max_tokens' => 2000
+                    ]);
+                    
+                    if ($response->successful()) {
+                        $data = $response->json();
+                        $parsedData = $this->parseAIResponse($data['choices'][0]['message']['content']);
+                        
+                        // Merge results
+                        if ($index === 0 && isset($parsedData['metadata'])) {
+                            $metadata = $parsedData['metadata'];
+                        }
+                        
+                        if (isset($parsedData['questions'])) {
+                            $allQuestions = array_merge($allQuestions, $parsedData['questions']);
+                        }
+                    }
+                } catch (\Exception $e) {
+                    Log::error("Error processing chunk {$index}: " . $e->getMessage());
+                }
+            }
+            
+            return [
+                'metadata' => $metadata,
+                'questions' => $allQuestions
+            ];
+    }
+
+    protected function splitTextIntoChunks(string $text, int $chunkSize): array
+    {
+        // Split text at paragraph boundaries to preserve context
+        $paragraphs = preg_split('/\n\s*\n/', $text);
+        $chunks = [];
+        $currentChunk = '';
+        
+        foreach ($paragraphs as $paragraph) {
+            if (strlen($currentChunk) + strlen($paragraph) > $chunkSize) {
+                $chunks[] = $currentChunk;
+                $currentChunk = $paragraph;
+            } else {
+                $currentChunk .= "\n\n" . $paragraph;
+            }
+        }
+        
+        if (!empty($currentChunk)) {
+            $chunks[] = $currentChunk;
+        }
+        
+        return $chunks;
     }
     
 
@@ -236,5 +367,151 @@ class OpenAIService implements AIServiceInterface
         $this->apiKey = $apiKey;
         $partialKey = substr($this->apiKey, 0, 8) . '...';
         Log::info("Updated OpenAIService API key to: {$partialKey}");
+    }
+
+    public function generateContent(string $prompt): array
+    {
+        $attempts = 0;
+        $maxAttempts = 3;
+        
+        while ($attempts < $maxAttempts) {
+            try {
+                Log::info('Sending answer generation request to OpenAI API (attempt ' . ($attempts + 1) . ')');
+                
+                $response = Http::withHeaders([
+                    'Authorization' => "Bearer {$this->apiKey}",
+                    'Content-Type' => 'application/json',
+                ])->timeout(90)
+                ->post("{$this->apiEndpoint}/chat/completions", [
+                    'model' => 'gpt-4o',
+                    'messages' => [
+                        [
+                            'role' => 'system',
+                            'content' => 'You are an expert teacher who provides comprehensive answers to exam questions. Provide detailed and accurate answers that would receive full marks. Always format your response as valid JSON.'
+                        ],
+                        [
+                            'role' => 'user',
+                            'content' => $prompt
+                        ]
+                    ],
+                    'temperature' => 0.5,
+                    'max_tokens' => 4000
+                ]);
+                
+                if ($response->successful()) {
+                    $data = $response->json();
+                    Log::info('Received successful response from OpenAI for answer generation');
+                    
+                    if (isset($data['choices'][0]['message']['content'])) {
+                        return [
+                            'success' => true,
+                            'content' => $data['choices'][0]['message']['content']
+                        ];
+                    }
+                    
+                    Log::error('Unexpected OpenAI response format', ['response' => $data]);
+                    return ['error' => 'Invalid response format from OpenAI API'];
+                } else {
+                    $error = $response->json();
+                    Log::error('OpenAI API error during answer generation:', $error);
+                    
+                    // For certain error types, we might want to retry immediately
+                    $errorMessage = $error['error']['message'] ?? 'Unknown error';
+                    $errorType = $error['error']['type'] ?? '';
+                    
+                    // Don't retry for authentication or invalid request errors
+                    if (in_array($errorType, ['authentication_error', 'invalid_request_error'])) {
+                        return ['error' => 'Failed to generate content with OpenAI: ' . $errorMessage];
+                    }
+                    
+                    // For rate limits and server errors, increment attempts and retry
+                    $attempts++;
+                    Log::warning("Attempt {$attempts} failed: {$errorMessage}");
+                    
+                    if ($attempts >= $maxAttempts) {
+                        return ['error' => 'Failed after multiple attempts: ' . $errorMessage];
+                    }
+                    
+                    // Wait before retry (exponential backoff)
+                    $backoffTime = pow(2, $attempts);
+                    Log::info("Waiting {$backoffTime} seconds before retry");
+                    sleep($backoffTime);
+                    continue;
+                }
+            } catch (\Exception $e) {
+                $attempts++;
+                Log::warning("Attempt {$attempts} failed with exception: " . $e->getMessage());
+                
+                if ($attempts >= $maxAttempts) {
+                    return ['error' => 'Failed after multiple attempts: ' . $e->getMessage()];
+                }
+                
+                // Wait before retry (exponential backoff)
+                $backoffTime = pow(2, $attempts);
+                Log::info("Waiting {$backoffTime} seconds before retry");
+                sleep($backoffTime);
+                continue;
+            }
+        }
+        
+        return ['error' => 'Failed to generate content after exhausting retry attempts'];
+    }
+    
+    /**
+     * Save answer for a specific question
+     * 
+     * @param string $content The content to save
+     * @param Question $question The question to associate the answer with
+     * @return array Response with success/error information
+     */
+    public function saveAnswer(string $content, Question $question): array
+    {
+        try {
+            // Save answer to database
+            $answer = new Answer();
+            $answer->question_id = $question->id;
+            $answer->content = $content;
+            $answer->format = $question->answer_format; // Use the format from the question
+            $answer->generated_by = 'openai';
+            $answer->generated_at = now();
+            $answer->metadata = [
+                'model' => 'gpt-4o',
+                'timestamp' => now()->timestamp,
+                'prompt_length' => strlen($prompt ?? '')
+            ];
+            $answer->save();
+            
+            // Update the question paper to indicate it has answers
+            $questionPaper = QuestionPaper::find($question->question_paper_id);
+            if (!$questionPaper->has_answers) {
+                $questionPaper->has_answers = true;
+                $questionPaper->answers_generated_at = now();
+                $questionPaper->save();
+            }
+            
+            // Count how many questions in this paper have answers
+            $totalQuestions = Question::where('question_paper_id', $question->question_paper_id)
+                ->where('parent_id', null) // Only count parent questions
+                ->count();
+            
+            $answeredQuestions = Question::where('question_paper_id', $question->question_paper_id)
+                ->where('parent_id', null) // Only count parent questions
+                ->whereHas('answer')
+                ->count();
+            
+            // If all questions have answers, you might want to generate the PDF
+            if ($totalQuestions === $answeredQuestions) {
+                // Logic to generate answers PDF could go here
+                // $this->generateAnswersPdf($questionPaper);
+            }
+            
+            return [
+                'success' => true,
+                'answer_id' => $answer->id
+            ];
+        } catch (\Exception $e) {
+            Log::error('Failed to save answer: ' . $e->getMessage());
+            return ['error' => 'Failed to save answer: ' . $e->getMessage()];
+        }
     }
 }

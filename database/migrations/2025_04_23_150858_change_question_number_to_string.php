@@ -11,8 +11,8 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::table('answers', function (Blueprint $table) {
-            $table->string('format', 20)->default('paragraph')->after('content');
+        Schema::table('questions', function (Blueprint $table) {
+            $table->string('question_number')->change();
         });
     }
 
@@ -21,8 +21,8 @@ return new class extends Migration
      */
     public function down(): void
     {
-        Schema::table('answers', function (Blueprint $table) {
-            $table->dropColumn('format');
+        Schema::table('questions', function (Blueprint $table) {
+            $table->string('question_number')->change();
         });
     }
 };

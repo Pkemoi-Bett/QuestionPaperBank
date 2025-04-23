@@ -94,6 +94,54 @@ class DeepSeekService implements AIServiceInterface
             Log::error('Exception in DeepSeek analysis:', ['message' => $e->getMessage()]);
             return ['error' => 'Failed to analyze document with DeepSeek: ' . $e->getMessage()];
         }
+    
+    }
+
+    /**
+     * Generate content based on a given prompt
+     *
+     * @param string $prompt The prompt for content generation
+     * @return array The generated content
+     */
+    public function generateContent(string $prompt): array
+    {
+        try {
+            Log::info('Sending content generation request to DeepSeek API');
+            
+            $response = Http::withHeaders([
+                'Authorization' => "Bearer {$this->apiKey}",
+                'Content-Type' => 'application/json',
+            ])->timeout(60)->post("{$this->apiEndpoint}/chat/completions", [
+                'model' => 'deepseek-chat',
+                'messages' => [
+                    [
+                        'role' => 'user',
+                        'content' => $prompt
+                    ]
+                ],
+                'temperature' => 0.7,
+                'max_tokens' => 1000
+            ]);
+            
+            if ($response->successful()) {
+                $data = $response->json();
+                Log::info('Received successful response for content generation');
+                
+                if (isset($data['choices'][0]['message']['content'])) {
+                    return ['content' => $data['choices'][0]['message']['content']];
+                }
+                
+                Log::error('Unexpected response format for content generation', ['response' => $data]);
+                return ['error' => 'Invalid response format from DeepSeek API'];
+            } else {
+                $error = $response->json();
+                Log::error('DeepSeek API error during content generation:', $error);
+                return ['error' => 'Failed to generate content with DeepSeek: ' . ($error['error']['message'] ?? 'Unknown error')];
+            }
+        } catch (\Exception $e) {
+            Log::error('Exception during content generation:', ['message' => $e->getMessage()]);
+            return ['error' => 'Failed to generate content with DeepSeek: ' . $e->getMessage()];
+        }
     }
     
     /**

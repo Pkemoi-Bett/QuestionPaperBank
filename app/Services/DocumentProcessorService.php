@@ -19,9 +19,12 @@ use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use ZipArchive;
 use Exception;
+use Llama\LlamaModel;
 
 class DocumentProcessorService
 {
+    protected $aiService;
+    protected $answerProcessor;
     protected $primaryAIService;
     protected $fallbackAIService;
     protected $providers = ['openai', 'deepseek'];
@@ -217,8 +220,10 @@ class DocumentProcessorService
         // Use AI to analyze the document content with fallback
         $analysisResult = $this->analyzeDocumentWithFallback($text);
         
-        if (isset($analysisResult['error'])) {
-            return $analysisResult;
+        // If both AI services failed, use basic extraction
+        if (isset($analysisResult['error']) && strpos($analysisResult['error'], 'All AI services failed') !== false) {
+            Log::warning('Using basic extraction fallback');
+            $analysisResult = $this->basicExtractionFallback($text, $originalFilename);
         }
         
         // Save the parsed data to the database
@@ -253,6 +258,184 @@ class DocumentProcessorService
             Log::error('Database error while processing file: ' . $e->getMessage());
             return ['error' => 'Database error: ' . $e->getMessage()];
         }
+    }
+    
+    /**
+     * Basic extraction fallback when AI services fail
+     * 
+     * @param string $text Document text content
+     * @param string $filename Original filename
+     * @return array Extracted metadata and questions
+     */
+    protected function basicExtractionFallback(string $text, string $filename): array
+    {
+        // Basic metadata extraction from filename and content
+        $metadata = $this->extractBasicMetadata($filename, $text);
+        
+        // Basic question extraction using regex patterns
+        $questions = $this->extractBasicQuestions($text);
+        
+        return [
+            'metadata' => $metadata,
+            'questions' => $questions
+        ];
+    }
+    
+    /**
+     * Extract basic metadata from filename and text content
+     * 
+     * @param string $filename Original filename
+     * @param string $text Document text content
+     * @return array Extracted metadata
+     */
+    protected function extractBasicMetadata(string $filename, string $text): array
+    {
+        $metadata = [
+            'examiner' => 'Unknown',
+            'subject' => 'Unknown Subject',
+            'class' => 'Unknown Class',
+            'curriculum' => '8-4-4',
+            'year' => date('Y'),
+            'term' => null,
+            'paper_type' => null
+        ];
+        
+        // Extract subject from filename
+        if (preg_match('/(math|english|kiswahili|science|social|geography|history|biology|chemistry|physics)/i', $filename, $matches)) {
+            $metadata['subject'] = ucfirst(strtolower($matches[1]));
+        }
+        
+        // Extract paper type
+        if (preg_match('/pp(\d+)|paper\s*(\d+)/i', $filename, $matches)) {
+            $metadata['paper_type'] = 'Paper ' . ($matches[1] ?: $matches[2]);
+        }
+        
+        // Try to extract year from content or filename
+        if (preg_match('/\b(20\d{2})\b/', $text . ' ' . $filename, $yearMatch)) {
+            $metadata['year'] = (int)$yearMatch[1];
+        }
+        
+        // Try to extract term
+        if (preg_match('/\bterm\s*(\d)\b/i', $text . ' ' . $filename, $termMatch)) {
+            $metadata['term'] = (int)$termMatch[1];
+        }
+        
+        // Try to extract class/form
+        if (preg_match('/\b(form|class|grade)\s*(\d+)\b/i', $text . ' ' . $filename, $classMatch)) {
+            $metadata['class'] = ucfirst(strtolower($classMatch[1])) . ' ' . $classMatch[2];
+        }
+        
+        // Try to extract examiner/exam board
+        $possibleExaminers = ['KNEC', 'KCSE', 'KCPE', 'MOCK', 'INTERNAL', 'TERM', 'ENDTERM', 'MIDTERM'];
+        foreach ($possibleExaminers as $examiner) {
+            if (stripos($text . ' ' . $filename, $examiner) !== false) {
+                $metadata['examiner'] = $examiner;
+                break;
+            }
+        }
+        
+        return $metadata;
+    }
+    
+    /**
+     * Extract questions using regex patterns
+     * 
+     * @param string $text Document text content
+     * @return array Extracted questions
+     */
+    protected function extractBasicQuestions(string $text): array
+    {
+        $questions = [];
+        
+        // Pattern for main questions like "1. What is..."
+        if (preg_match_all('/(?:\n|\A)(\d+)\.\s+([^\n]+(?:\n(?!\d+\.).+)*)/s', $text, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $questionNumber = (int)$match[1];
+                $content = trim($match[2]);
+                
+                // Extract marks if present
+                $marks = null;
+                if (preg_match('/\((\d+)\s*(?:marks|mark)\)/i', $content, $markMatch)) {
+                    $marks = (int)$markMatch[1];
+                }
+                
+                // Try to extract sub-questions
+                $subQuestions = $this->extractSubQuestions($content);
+                
+                $questions[] = [
+                    'question_number' => $questionNumber,
+                    'content' => $content,
+                    'level' => 1,
+                    'marks' => $marks,
+                    'answer_format' => $this->detectAnswerFormat($content),
+                    'answer' => null, // No automatic answer generation in basic mode
+                    'sub_questions' => $subQuestions
+                ];
+            }
+        }
+        
+        return $questions;
+    }
+    
+    /**
+     * Extract sub-questions from question content
+     * 
+     * @param string $content Question content
+     * @return array Extracted sub-questions
+     */
+    protected function extractSubQuestions(string $content): array
+    {
+        $subQuestions = [];
+        
+        // Pattern for sub-questions like "a) What is..." or "(a) What is..."
+        if (preg_match_all('/(?:\n|\A)(?:(?:\()?([a-z])(?:\))?|([ivxlcdm]+)(?:[\.\)])|([a-z])(?:[\.\)]))\s+([^\n]+(?:\n(?!(?:\()?[a-z](?:\))?|[ivxlcdm]+(?:[\.\)])|[a-z](?:[\.\)]))(?![\d])(?!\n\d+\.).+)*)/si', $content, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $letter = !empty($match[1]) ? $match[1] : (!empty($match[2]) ? $match[2] : $match[3]);
+                $subContent = trim($match[4]);
+                
+                // Extract marks if present
+                $marks = null;
+                if (preg_match('/\((\d+)\s*(?:marks|mark)\)/i', $subContent, $markMatch)) {
+                    $marks = (int)$markMatch[1];
+                }
+                
+                $subQuestions[] = [
+                    'question_number' => $letter,
+                    'content' => $subContent,
+                    'level' => 2,
+                    'marks' => $marks,
+                    'answer_format' => $this->detectAnswerFormat($subContent),
+                    'answer' => null, // No automatic answer generation in basic mode
+                    'sub_questions' => [] // Third-level questions not implemented in basic extraction
+                ];
+            }
+        }
+        
+        return $subQuestions;
+    }
+    
+    /**
+     * Detect appropriate answer format based on question content
+     * 
+     * @param string $content Question content
+     * @return string Answer format (points or paragraph)
+     */
+    protected function detectAnswerFormat(string $content): string
+    {
+        $content = strtolower($content);
+        
+        // Check for point-based question indicators
+        if (preg_match('/(list|state|identify|outline|mention|name|give|provide|specify|enumerate)/i', $content)) {
+            return 'points';
+        }
+        
+        // Check for paragraph-based question indicators
+        if (preg_match('/(explain|describe|discuss|analyze|examine|evaluate|compare|contrast|elaborate|justify|illustrate|assess)/i', $content)) {
+            return 'paragraph';
+        }
+        
+        // Default to paragraph if not determined
+        return 'paragraph';
     }
     
     /**
@@ -453,161 +636,95 @@ class DocumentProcessorService
         
         return '';
     }
-    
     /**
-     * Store question paper and its metadata in the database
+     * Store question paper metadata in the database
      */
-    // protected function storeQuestionPaper(array $analysisResult, string $originalFilename, string $filePath, string $extension): QuestionPaper
-    // {
-    //     $metadata = $analysisResult['metadata'] ?? [];
+    protected function storeQuestionPaper(array $analysisResult, string $originalFilename, string $filePath, string $extension): QuestionPaper
+    {
+        $metadata = $analysisResult['metadata'] ?? [];
         
-    //     // Get or create examiner
-    //     $examiner = null;
-    //     if (!empty($metadata['examiner'])) {
-    //         $examiner = Examiner::firstOrCreate(['name' => $metadata['examiner']]);
-    //     }
-        
-    //     // Get or create curriculum
-    //     $curriculumName = $metadata['curriculum'] ?? '8-4-4'; // Default to 8-4-4 if not specified
-    //     $curriculum = Curriculum::firstOrCreate(['name' => $curriculumName]);
-        
-    //     // Get or create subject
-    //     $subject = null;
-    //     if (!empty($metadata['subject'])) {
-    //         $subject = Subject::firstOrCreate(
-    //             ['name' => $metadata['subject'], 'curriculum_id' => $curriculum->id],
-    //             ['code' => substr(strtoupper($metadata['subject']), 0, 3)]
-    //         );
-    //     } else {
-    //         // Create a default subject if none is found
-    //         $subject = Subject::firstOrCreate(
-    //             ['name' => 'Unknown Subject', 'curriculum_id' => $curriculum->id],
-    //             ['code' => 'UNK']
-    //         );
-    //     }
-        
-    //     // Get or create class
-    //     $class = null;
-    //     if (!empty($metadata['class'])) {
-    //         $class = Classes::firstOrCreate(
-    //             ['name' => $metadata['class'], 'curriculum_id' => $curriculum->id]
-    //         );
-    //     } else {
-    //         // Create a default class if none is found
-    //         $class = Classes::firstOrCreate(
-    //             ['name' => 'Unknown Class', 'curriculum_id' => $curriculum->id]
-    //         );
-    //     }
-        
-    //     // Create question paper record
-    //     $questionPaper = QuestionPaper::create([
-    //         'examiner_id' => $examiner ? $examiner->id : null,
-    //         'subject_id' => $subject->id,
-    //         'class_id' => $class->id,
-    //         'curriculum_id' => $curriculum->id,
-    //         'term' => $metadata['term'] ?? null,
-    //         'year' => $metadata['year'] ?? date('Y'),
-    //         'paper_type' => $metadata['paper_type'] ?? null,
-    //         'original_filename' => $originalFilename,
-    //         'file_path' => $filePath,
-    //         'file_type' => $extension,
-    //         'is_processed' => true,
-    //         'metadata' => $analysisResult['metadata'] ?? null
-    //     ]);
-        
-    //     return $questionPaper;
-    // }
-    /**
- * Store question paper and its metadata in the database
- */
-protected function storeQuestionPaper(array $analysisResult, string $originalFilename, string $filePath, string $extension): QuestionPaper
-{
-    $metadata = $analysisResult['metadata'] ?? [];
-    
-    // Get or create examiner
-    $examiner = null;
-    if (!empty($metadata['examiner']) && $metadata['examiner'] !== 'Not specified') {
-        $examiner = Examiner::firstOrCreate(['name' => $metadata['examiner']]);
-    }
-    
-    // Get or create curriculum
-    $curriculumName = $metadata['curriculum'] ?? '8-4-4'; // Default to 8-4-4 if not specified
-    $curriculumName = $curriculumName === 'Not specified' ? '8-4-4' : $curriculumName;
-    $curriculum = Curriculum::firstOrCreate(['name' => $curriculumName]);
-    
-    // Get or create subject
-    $subject = null;
-    if (!empty($metadata['subject']) && $metadata['subject'] !== 'Not specified') {
-        $subject = Subject::firstOrCreate(
-            ['name' => $metadata['subject'], 'curriculum_id' => $curriculum->id],
-            ['code' => substr(strtoupper($metadata['subject']), 0, 3)]
-        );
-    } else {
-        // Create a default subject if none is found
-        $subject = Subject::firstOrCreate(
-            ['name' => 'Unknown Subject', 'curriculum_id' => $curriculum->id],
-            ['code' => 'UNK']
-        );
-    }
-    
-    // Get or create class
-    $class = null;
-    if (!empty($metadata['class']) && $metadata['class'] !== 'Not specified') {
-        $class = Classes::firstOrCreate(
-            ['name' => $metadata['class'], 'curriculum_id' => $curriculum->id]
-        );
-    } else {
-        // Create a default class if none is found
-        $class = Classes::firstOrCreate(
-            ['name' => 'Unknown Class', 'curriculum_id' => $curriculum->id]
-        );
-    }
-    
-    // Process term data to ensure it's an integer or null
-    $term = null;
-    if (isset($metadata['term']) && $metadata['term'] !== 'Not specified') {
-        // Extract numeric value if it's something like "Term 1"
-        if (preg_match('/(\d+)/', $metadata['term'], $matches)) {
-            $term = (int)$matches[1];
-        } 
-        // If it's already a numeric value
-        else if (is_numeric($metadata['term'])) {
-            $term = (int)$metadata['term'];
+        // Get or create examiner
+        $examiner = null;
+        if (!empty($metadata['examiner']) && $metadata['examiner'] !== 'Not specified') {
+            $examiner = Examiner::firstOrCreate(['name' => $metadata['examiner']]);
         }
+        
+        // Get or create curriculum
+        $curriculumName = $metadata['curriculum'] ?? '8-4-4'; // Default to 8-4-4 if not specified
+        $curriculumName = $curriculumName === 'Not specified' ? '8-4-4' : $curriculumName;
+        $curriculum = Curriculum::firstOrCreate(['name' => $curriculumName]);
+        
+        // Get or create subject
+        $subject = null;
+        if (!empty($metadata['subject']) && $metadata['subject'] !== 'Not specified') {
+            $subject = Subject::firstOrCreate(
+                ['name' => $metadata['subject'], 'curriculum_id' => $curriculum->id],
+                ['code' => substr(strtoupper($metadata['subject']), 0, 3)]
+            );
+        } else {
+            // Create a default subject if none is found
+            $subject = Subject::firstOrCreate(
+                ['name' => 'Unknown Subject', 'curriculum_id' => $curriculum->id],
+                ['code' => 'UNK']
+            );
+        }
+        
+        // Get or create class
+        $class = null;
+        if (!empty($metadata['class']) && $metadata['class'] !== 'Not specified') {
+            $class = Classes::firstOrCreate(
+                ['name' => $metadata['class'], 'curriculum_id' => $curriculum->id]
+            );
+        } else {
+            // Create a default class if none is found
+            $class = Classes::firstOrCreate(
+                ['name' => 'Unknown Class', 'curriculum_id' => $curriculum->id]
+            );
+        }
+        
+        // Process term data to ensure it's an integer or null
+        $term = null;
+        if (isset($metadata['term']) && $metadata['term'] !== 'Not specified') {
+            // Extract numeric value if it's something like "Term 1"
+            if (preg_match('/(\d+)/', $metadata['term'], $matches)) {
+                $term = (int)$matches[1];
+            } 
+            // If it's already a numeric value
+            else if (is_numeric($metadata['term'])) {
+                $term = (int)$metadata['term'];
+            }
+        }
+        
+        // Process year data to ensure it's an integer
+        $year = date('Y'); // Default to current year
+        if (isset($metadata['year']) && is_numeric($metadata['year'])) {
+            $year = (int)$metadata['year'];
+        }
+        
+        // Create question paper record
+        $questionPaper = QuestionPaper::create([
+            'examiner_id' => $examiner ? $examiner->id : null,
+            'subject_id' => $subject->id,
+            'class_id' => $class->id,
+            'curriculum_id' => $curriculum->id,
+            'term' => $term, // Will be null if "Not specified" or not numeric
+            'year' => $year,
+            'paper_type' => $metadata['paper_type'] ?? null,
+            'original_filename' => $originalFilename,
+            'file_path' => $filePath,
+            'file_type' => $extension,
+            'is_processed' => true,
+            'metadata' => $analysisResult['metadata'] ?? null
+        ]);
+        
+        return $questionPaper;
     }
-    
-    // Process year data to ensure it's an integer
-    $year = date('Y'); // Default to current year
-    if (isset($metadata['year']) && is_numeric($metadata['year'])) {
-        $year = (int)$metadata['year'];
-    }
-    
-    // Create question paper record
-    $questionPaper = QuestionPaper::create([
-        'examiner_id' => $examiner ? $examiner->id : null,
-        'subject_id' => $subject->id,
-        'class_id' => $class->id,
-        'curriculum_id' => $curriculum->id,
-        'term' => $term, // Will be null if "Not specified" or not numeric
-        'year' => $year,
-        'paper_type' => $metadata['paper_type'] ?? null,
-        'original_filename' => $originalFilename,
-        'file_path' => $filePath,
-        'file_type' => $extension,
-        'is_processed' => true,
-        'metadata' => $analysisResult['metadata'] ?? null
-    ]);
-    
-    return $questionPaper;
-}
 
     
     /**
      * Process and store questions and answers recursively
      */
-/**
- * Process and store questions and answers recursively with proper formatting
- */
+
 protected function processQuestions(array $questions, QuestionPaper $questionPaper, int $parentId = null): void
 {
     foreach ($questions as $questionData) {
@@ -703,4 +820,100 @@ protected function processQuestions(array $questions, QuestionPaper $questionPap
         
         return $this;
     }
+
+    public function generateAnswers(QuestionPaper $questionPaper): array
+    {
+        try {
+            Log::info("Starting answer generation for question paper #{$questionPaper->id}");
+            
+            // Get all questions for this paper
+            $questions = $questionPaper->questions()->whereNull('parent_id')->get();
+            
+            if ($questions->isEmpty()) {
+                return [
+                    'success' => false,
+                    'error' => 'No questions found for this paper'
+                ];
+            }
+            
+            // Create a combined prompt for all questions
+            $prompt = $this->createPrompt($questionPaper, $questions);
+            
+            // Send to AI service
+            Log::info("Sending combined questions to AI service");
+            $result = $this->aiService->generateContent($prompt);
+            
+            if (!isset($result['success']) || !$result['success']) {
+                Log::error("AI service failed to generate answers", [
+                    'error' => $result['error'] ?? 'Unknown error'
+                ]);
+                return $result;
+            }
+            
+            // Process and save the answers
+            Log::info("AI response received, processing answers");
+            $saveResult = $this->answerProcessor->processAndSaveAnswers(
+                $result['content'],
+                $questionPaper->id
+            );
+            
+            return $saveResult;
+            
+        } catch (\Exception $e) {
+            Log::error('Error generating answers: ' . $e->getMessage(), [
+                'trace' => $e->getTraceAsString()
+            ]);
+            
+            return [
+                'success' => false,
+                'error' => 'Error generating answers: ' . $e->getMessage()
+            ];
+        }
+    }
+    
+    /**
+     * Create a prompt for the AI service
+     * 
+     * @param QuestionPaper $questionPaper The question paper
+     * @param \Illuminate\Database\Eloquent\Collection $questions The questions
+     * @return string The formatted prompt
+     */
+    private function createPrompt(QuestionPaper $questionPaper, $questions): string
+    {
+        $subject = $questionPaper->subject->name ?? 'Unknown Subject';
+        $class = $questionPaper->class->name ?? 'Unknown Class';
+        $curriculum = $questionPaper->curriculum->name ?? 'Unknown Curriculum';
+        
+        $prompt = "You are an expert teacher for {$subject} for {$class} in the {$curriculum} curriculum.\n\n";
+        $prompt .= "Please provide detailed and accurate answers for the following exam questions.\n";
+        $prompt .= "Format your response as a JSON object with a 'questions' array containing each question and its answer.\n\n";
+        
+        $prompt .= "For each question include:\n";
+        $prompt .= "- question_number (e.g., '1', '1a')\n";
+        $prompt .= "- content (the question text)\n";
+        $prompt .= "- answer (your detailed answer)\n";
+        $prompt .= "- answer_format ('paragraph' or 'points')\n\n";
+        
+        $prompt .= "For questions that require point-form answers, provide an array of points. For paragraph answers, provide a detailed paragraph.\n\n";
+        
+        $prompt .= "Questions:\n\n";
+        
+        foreach ($questions as $question) {
+            $prompt .= "Question {$question->question_number}: {$question->content}\n";
+            
+            // Include sub-questions if any
+            $subQuestions = $question->subQuestions;
+            foreach ($subQuestions as $subQuestion) {
+                $prompt .= "Question {$subQuestion->question_number}: {$subQuestion->content}\n";
+            }
+            
+            $prompt .= "\n";
+        }
+        
+        $prompt .= "Please format your response as a valid JSON object.";
+        
+        return $prompt;
+    }
+
+    
 }

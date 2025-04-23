@@ -20,11 +20,17 @@ return new class extends Migration
             $table->integer('term')->nullable();
             $table->integer('year');
             $table->string('paper_type')->nullable(); // Paper 1, Paper 2
+            $table->string('title')->nullable(); // Add a title field for better identification
             $table->string('original_filename');
             $table->string('file_path');
             $table->string('file_type');
             $table->boolean('is_processed')->default(false);
+            $table->boolean('has_answers')->default(false); // Flag to indicate if answers have been generated
+            $table->integer('total_marks')->nullable(); // Store total marks for the paper
+            $table->integer('duration')->nullable(); // Duration in minutes
             $table->json('metadata')->nullable();
+            $table->timestamp('answers_generated_at')->nullable(); // When answers were last generated
+            $table->string('answers_pdf_path')->nullable(); // Store path to generated PDF
             $table->timestamps();
         });
     }

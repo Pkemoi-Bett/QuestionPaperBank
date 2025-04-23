@@ -142,6 +142,7 @@ class QuestionPaperController extends Controller
             'limit' => 'nullable|integer|min:1|max:100',
             'with_answers' => 'nullable|boolean',
             'examiner_id' => 'nullable|integer|exists:examiners,id',
+            'has_answers' => 'nullable|boolean', // New filter for papers with answers
         ]);
         
         if ($validator->fails()) {
@@ -187,26 +188,41 @@ class QuestionPaperController extends Controller
             $query->where('examiner_id', $request->examiner_id);
         }
         
+        // Filter papers that have answers
+        if ($request->filled('has_answers')) {
+            $query->where('has_answers', $request->has_answers);
+        }
+        
         // Check if we should include questions and answers
         if ($request->filled('with_answers') && $request->with_answers) {
             $query->with([
                 'questions' => function($q) {
-                    $q->whereNull('parent_id')->with([
-                        'subQuestions' => function($sq) {
-                            $sq->with(['answers', 'subQuestions.answers']);
-                        },
-                        'answers'
+                    $q->whereNull('parent_id')
+                      ->orderBy('order')
+                      ->orderBy('question_number')
+                      ->with([
+                        'answer', // Changed from 'answers' to 'answer' for the hasOne relationship
+                        'children' => function($sq) { // Changed from 'subQuestions' to 'children' to match the relationship
+                            $sq->orderBy('order')
+                              ->orderBy('question_number')
+                              ->with(['answer', 'children.answer']); // Similarly adjusted here
+                        }
                     ]);
                 }
             ]);
         } else {
             $query->with([
                 'questions' => function($q) {
-                    $q->whereNull('parent_id')->with([
-                        'subQuestions' => function($sq) {
-                            $sq->withCount('answers');
+                    $q->whereNull('parent_id')
+                      ->orderBy('order')
+                      ->orderBy('question_number')
+                      ->with([
+                        'children' => function($sq) {
+                            $sq->orderBy('order')
+                              ->orderBy('question_number')
+                              ->withCount('answer');
                         }
-                    ])->withCount('answers');
+                    ])->withCount('answer');
                 }
             ]);
         }
@@ -218,9 +234,47 @@ class QuestionPaperController extends Controller
         $questionPapers = $query->orderBy('created_at', 'desc')
                                ->paginate($limit);
         
+        // Transform the data to include answer information
+        $transformedData = $questionPapers->through(function($paper) use ($request) {
+            $paperArray = $paper->toArray();
+            
+            // Calculate answer completion percentage
+            if (isset($paperArray['questions']) && count($paperArray['questions']) > 0) {
+                $totalQuestions = 0;
+                $answeredQuestions = 0;
+                
+                foreach ($paperArray['questions'] as $question) {
+                    $totalQuestions++;
+                    if (isset($question['answer']) && $question['answer']) {
+                        $answeredQuestions++;
+                    }
+                    
+                    // Count sub-questions
+                    if (isset($question['children']) && count($question['children']) > 0) {
+                        foreach ($question['children'] as $subQuestion) {
+                            $totalQuestions++;
+                            if (isset($subQuestion['answer']) && $subQuestion['answer']) {
+                                $answeredQuestions++;
+                            }
+                        }
+                    }
+                }
+                
+                $paperArray['answer_stats'] = [
+                    'total_questions' => $totalQuestions,
+                    'answered_questions' => $answeredQuestions,
+                    'completion_percentage' => $totalQuestions > 0 ? 
+                        round(($answeredQuestions / $totalQuestions) * 100) : 0,
+                    'is_complete' => $totalQuestions > 0 && $answeredQuestions == $totalQuestions
+                ];
+            }
+            
+            return $paperArray;
+        });
+        
         return response()->json([
             'success' => true,
-            'data' => $questionPapers,
+            'data' => $transformedData,
             'meta' => [
                 'total' => $questionPapers->total(),
                 'per_page' => $questionPapers->perPage(),
